@@ -34,9 +34,12 @@ ordinary Brazilian can read it. Site language: pt-BR. Built one power at a time,
 - The yearly bulk files are the base, but they are NOT complete: air tickets
   (`PASSAGEM AÉREA - SIGEPA`) stop appearing in them in August 2025. The API still has them.
   **No 2025 or 2026 total is complete until the API cross-check exists.**
-- The API is not complete either (it lacks rows the bulk has), its `ano` filter returned nothing for
-  anyone on 2026-10-12 (ask by `idLegislatura`), and it can repeat rows across pages. Accept a crawl
-  only when the number of distinct rows equals the `x-total-count` header.
+- The API is not complete either: it lacks rows the bulk has. Its `ano` filter only works together
+  with `idLegislatura` (alone it returned nothing for anyone on 2026-10-12).
+- The API shows fewer fields than the bulk, so different receipts can look identical in it (two
+  segments of a flight, for example: 37 such rows in 5,852 for one deputy). Never de-duplicate API rows
+  by content, match the two sources as counted sets, and accept a crawl only when the number of rows
+  received equals the `x-total-count` header. The bulk files have no exact-copy rows.
 - The owner's earlier project (Super-trunfo, kept outside this repository) is a read-only reference.
   Its database misses about half of 2023-2024 and is not a source of truth for totals.
 

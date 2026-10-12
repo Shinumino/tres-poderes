@@ -4,12 +4,15 @@ One row of the file is one receipt. Every column is kept exactly as the Camara w
 the Camara's own column name, so a row here can be laid beside the official file and compared by
 eye. The few typed columns next to them (year, month, deputy, centavos) are what the totals use.
 """
+import collections
+import contextlib
 import csv
 import dataclasses
 import decimal
 import hashlib
 import io
-import itertools
+import pathlib
+import re
 import sqlite3
 import zipfile
 
@@ -35,7 +38,10 @@ CREATE TABLE IF NOT EXISTS camara_cota (
     linha INTEGER NOT NULL,                -- line of this receipt in the year's file (the header is line 1)
     {", ".join(f'"{name}" TEXT NOT NULL' for name in COLUMNS)}
 ) STRICT;
-CREATE INDEX IF NOT EXISTS camara_cota_deputado_ano ON camara_cota (deputado, ano);
+-- Year first: replacing, counting and summing a year all start from "WHERE ano = ?". With the
+-- deputy first, each of those read the whole table (0.8 s per year total, measured 2026-10-12).
+-- The amount rides along so a total is answered from the index alone.
+CREATE INDEX IF NOT EXISTS camara_cota_ano_deputado ON camara_cota (ano, deputado, liquido_centavos);
 CREATE TABLE IF NOT EXISTS camara_cota_arquivo (
     ano INTEGER PRIMARY KEY,               -- one current file per year
     -- Of the CSV inside the zip, not of the zip: the Camara rebuilds every zip each night, so the
@@ -45,6 +51,7 @@ CREATE TABLE IF NOT EXISTS camara_cota_arquivo (
 ) STRICT;
 """
 
+_YEAR_FILE = re.compile(r"Ano-(\d{4})\.csv")  # the one file inside every yearly zip, 2008 to 2026
 _TYPED = 5  # ano, mes, deputado, liquido_centavos, linha: the columns before the Camara's own
 _INSERT = f"INSERT INTO camara_cota VALUES ({', '.join('?' * (_TYPED + len(COLUMNS)))})"
 
@@ -52,6 +59,11 @@ _INSERT = f"INSERT INTO camara_cota VALUES ({', '.join('?' * (_TYPED + len(COLUM
 def connect(path):
     """Open (and if new, create) the database."""
     db = sqlite3.connect(path)
+    # Write-ahead log: someone reading while the nightly load replaces a year is not locked out,
+    # and keeps seeing the year as it was until the load commits. In SQLite's default mode that
+    # reader gets "database is locked". It needs a local disk: WAL does not work on synced or
+    # network folders.
+    db.execute("PRAGMA journal_mode = WAL")
     db.executescript(_SCHEMA)
     return db
 
@@ -73,9 +85,12 @@ def _typed(line, row, year):
         liquido = parse_centavos(row["vlrLiquido"])
         if liquido is None:
             raise ValueError("vlrLiquido is empty")
+        month = int(row["numMes"])
+        if not 1 <= month <= 12:
+            raise ValueError(f"numMes is {month}")
         return (
             year,
-            int(row["numMes"]),
+            month,
             int(row["ideCadastro"]) if row["ideCadastro"] else None,
             liquido,
             line,
@@ -99,8 +114,7 @@ def load_cota(db, zip_path):
     corrected shows the new value and one it withdrew is gone. Content already loaded is left alone.
     Returns the year.
     """
-    with zipfile.ZipFile(zip_path) as archive:
-        (member,) = archive.namelist()
+    with _year_archive(zip_path) as (archive, member, year):
         with archive.open(member) as raw:
             content = _sha256(raw)
         already = db.execute("SELECT ano FROM camara_cota_arquivo WHERE sha256 = ?", (content,)).fetchone()
@@ -113,20 +127,48 @@ def load_cota(db, zip_path):
                 # The Camara renaming or adding a column is exactly when a loader goes quietly wrong.
                 missing, new = sorted(set(COLUMNS) - set(found)), sorted(set(found) - set(COLUMNS))
                 raise BadFile(f"{member}: columns changed (missing {missing}, new {new}, or their order)")
-            numbered = ((reader.line_num, row) for row in reader)
-            first = next(numbered, None)
-            if first is None:
-                raise BadFile(f"{member}: no receipts")
-            try:
-                year = int(first[1]["numAno"])
-            except (TypeError, ValueError) as error:
-                raise BadFile(f"line {first[0]}: numAno is {first[1]['numAno']!r}") from error
             # One transaction: readers see the old year or the new year, never half of each.
             with db:
                 db.execute("DELETE FROM camara_cota WHERE ano = ?", (year,))
                 db.execute("INSERT OR REPLACE INTO camara_cota_arquivo VALUES (?, ?, ?)", (year, content, member))
-                db.executemany(_INSERT, (_typed(line, row, year) for line, row in itertools.chain([first], numbered)))
+                if not db.executemany(_INSERT, _rows(reader, year)).rowcount:
+                    raise BadFile(f"{member}: no receipts")
             return year
+
+
+@contextlib.contextmanager
+def _year_archive(zip_path):
+    """Open a yearly zip and yield (archive, the CSV inside, the year that CSV is named for).
+
+    The year comes from the name the Camara gave the file, and every row must agree with it. Taking
+    it from the rows instead let a file named for one year but holding another replace the wrong one.
+    """
+    name = pathlib.Path(zip_path).name
+    try:
+        archive = zipfile.ZipFile(zip_path)
+    except zipfile.BadZipFile as error:
+        raise BadFile(f"{name}: not a zip file") from error
+    with archive:
+        members = archive.namelist()
+        named = _YEAR_FILE.fullmatch(members[0]) if len(members) == 1 else None
+        if not named:
+            raise BadFile(f"{name}: expected exactly one file inside, named Ano-<year>.csv, found {members}")
+        yield archive, members[0], int(named[1])
+
+
+def _rows(reader, year):
+    lines = {}  # digest of a row -> the line it was first seen on
+    for row in reader:
+        line = reader.line_num
+        typed = _typed(line, row, year)
+        # The 19 real files hold 5.2 million receipts and not one exact copy (counted 2026-10-12).
+        # A copy therefore means the same reimbursement arrived twice, and adding it would pay it
+        # into somebody's total twice.
+        digest = hashlib.blake2b("\x1f".join(typed[_TYPED:]).encode(), digest_size=16).digest()
+        if digest in lines:
+            raise BadFile(f"line {line}: an exact copy of line {lines[digest]}")
+        lines[digest] = line
+        yield typed
 
 
 @dataclasses.dataclass(frozen=True)
@@ -160,26 +202,65 @@ def receipts_without_deputy(db, year):
     return _receipts(db, "c.ano = ? AND c.deputado IS NULL", (year,))
 
 
-def file_totals(zip_path):
-    """(year, receipts, centavos paid) of a yearly file, worked out a second way.
+@dataclasses.dataclass(frozen=True)
+class FileTotals:
+    ano: int
+    receipts: int
+    centavos: int
+    por_deputado: dict        # deputy id, or None for the leaderships -> centavos paid
+    sha256: str               # of the CSV inside: the hash load_cota records for a loaded year
 
-    On purpose this shares nothing with load_cota beyond reading the CSV: decimal arithmetic
-    straight from the text instead of parse_centavos, a running sum instead of SQL. If the two
+
+def file_totals(zip_path):
+    """What a yearly file says, worked out a second way.
+
+    On purpose this shares nothing with load_cota beyond opening the CSV: decimal arithmetic
+    straight from the text instead of parse_centavos, running sums instead of SQL. If the two
     ever disagree, one of them is wrong, and that is the reason to keep both.
     """
-    years, count, total = set(), 0, decimal.Decimal(0)
-    with zipfile.ZipFile(zip_path) as archive:
-        (member,) = archive.namelist()
+    count, total, by_deputy = 0, decimal.Decimal(0), collections.defaultdict(decimal.Decimal)
+    with _year_archive(zip_path) as (archive, member, year):
         with archive.open(member) as raw:
-            for row in csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""), delimiter=";"):
-                years.add(row["numAno"])
+            content = _sha256(raw)
+        with archive.open(member) as raw:
+            reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""), delimiter=";")
+            for row in reader:
+                try:
+                    amount = decimal.Decimal(row["vlrLiquido"])
+                    if not amount.is_finite() or int(row["numAno"]) != year:
+                        raise ValueError(f"vlrLiquido {row['vlrLiquido']!r}, numAno {row['numAno']!r} in the file of {year}")
+                    deputy = int(row["ideCadastro"]) if row["ideCadastro"] else None
+                except (KeyError, TypeError, ValueError, decimal.InvalidOperation) as error:
+                    raise BadFile(f"{member} line {reader.line_num}: {error!r}") from error
                 count += 1
-                total += decimal.Decimal(row["vlrLiquido"])
-    (year,) = years
-    centavos = total * 100
-    if centavos != centavos.to_integral_value():
-        raise BadFile(f"{member}: the amounts paid do not add up to whole centavos ({total})")
-    return int(year), count, int(centavos)
+                total += amount
+                by_deputy[deputy] += amount
+    if not count:
+        raise BadFile(f"{member}: no receipts")
+
+    def whole_centavos(amount):
+        centavos = amount * 100
+        if centavos != centavos.to_integral_value():
+            raise BadFile(f"{member}: the amounts paid do not add up to whole centavos ({amount})")
+        return int(centavos)
+
+    return FileTotals(year, count, whole_centavos(total), {d: whole_centavos(a) for d, a in by_deputy.items()}, content)
+
+
+def years(db):
+    """The years the database holds a file for."""
+    return [row[0] for row in db.execute("SELECT ano FROM camara_cota_arquivo ORDER BY ano")]
+
+
+def loaded_sha256(db, year):
+    """Hash of the file content the year was loaded from, or None when the year was never loaded."""
+    row = db.execute("SELECT sha256 FROM camara_cota_arquivo WHERE ano = ?", (year,)).fetchone()
+    return row[0] if row else None
+
+
+def totals_by_deputy(db, year):
+    """Centavos paid in the year for each deputy id; the key None holds the party leaderships."""
+    return dict(db.execute("SELECT deputado, SUM(liquido_centavos) FROM camara_cota WHERE ano = ? GROUP BY deputado", (year,)))
 
 
 def receipt_count(db, year):

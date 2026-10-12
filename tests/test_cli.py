@@ -49,6 +49,30 @@ class LoadCotaCommand(unittest.TestCase):
         self.assertIn("Ano-2099.csv.zip", self.out.getvalue())
         self.assertIn("18.235", self.out.getvalue())
 
+    def test_a_folder_with_no_yearly_files_fails_instead_of_passing_quietly(self):
+        # A mistyped --raw used to "load" nothing and report success over a stale database.
+        code = self.run_command()
+
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.raw), self.out.getvalue())
+
+    def test_a_corrupt_download_is_refused_and_the_other_years_still_load(self):
+        year_file(self.raw, 2098, [receipt(1001, "10")])
+        (self.raw / "Ano-2099.csv.zip").write_bytes(b"<html><body>503 Service Unavailable</body></html>")
+
+        code = self.run_command()
+
+        self.assertEqual(code, 1)
+        self.assertEqual(self.total(2098), 1000)
+        self.assertIn("Ano-2099.csv.zip", self.out.getvalue())
+
+    def test_the_database_folder_is_created_on_a_fresh_checkout(self):
+        year_file(self.raw, 2099, [receipt(1001, "10")])
+        self.database = self.raw / "not" / "there" / "yet" / "out.db"
+
+        self.assertEqual(self.run_command(), 0)
+        self.assertEqual(self.total(2099), 1000)
+
 
 class VerifyCotaCommand(unittest.TestCase):
     """Does the database say what the files on disk say, to the centavo and to the row?"""
@@ -88,6 +112,57 @@ class VerifyCotaCommand(unittest.TestCase):
 
         self.assertEqual(code, 1)
         self.assertIn("2097", self.out.getvalue())
+
+    def different_lines(self):
+        return [line for line in self.out.getvalue().splitlines() if "DIFFERENT" in line]
+
+    def test_a_receipt_moved_to_another_deputy_fails_though_count_and_total_match(self):
+        # Same three receipts, same R$ 1.174,43: but the R$ 1.467,00 now belongs to deputy 2002.
+        year_file(self.raw, 2099, [receipt(2002, "1467"), receipt(1001, "-298.07"), receipt(None, "5.50")])
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        [line] = self.different_lines()
+        self.assertIn("2099", line)
+        self.assertIn("2002", line)
+
+    def test_a_receipt_that_changed_without_changing_any_total_fails(self):
+        # Only the month moved: every sum is the same, the content is not.
+        year_file(self.raw, 2099, [receipt(1001, "1467", numMes="2"), receipt(1001, "-298.07"), receipt(None, "5.50")])
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        [line] = self.different_lines()
+        self.assertIn("2099", line)
+
+    def test_a_folder_with_no_yearly_files_fails_instead_of_passing_quietly(self):
+        for path in self.raw.glob("Ano-*.csv.zip"):
+            path.unlink()
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        self.assertIn(str(self.raw), self.out.getvalue())
+
+    def test_a_year_in_the_database_whose_file_is_gone_fails(self):
+        (self.raw / "Ano-2098.csv.zip").unlink()
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        [line] = [line for line in self.out.getvalue().splitlines() if "2098" in line]
+        self.assertIn("no file", line)
+
+    def test_a_file_that_cannot_be_read_is_reported_and_the_rest_still_checked(self):
+        (self.raw / "Ano-2098.csv.zip").write_bytes(b"not a zip at all")
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        self.assertIn("Ano-2098.csv.zip", self.out.getvalue())
+        self.assertIn("2099: 3 receipts, R$ 1.174,43", self.out.getvalue())
 
 
 if __name__ == "__main__":

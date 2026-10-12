@@ -76,7 +76,7 @@ def read_bulk():
 
 
 def read_old(db_path):
-    con = sqlite3.connect(pathlib.Path(db_path).as_uri() + "?mode=ro&immutable=1", uri=True)
+    con = sqlite3.connect(pathlib.Path(db_path).resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
     columns = [c[1] for c in con.execute("PRAGMA table_info(despesas_deputados)")]
     # NOT INDEXED: one pass over the table. Through the (id_deputado, ano) index it would be
     # millions of row lookups on a file that lives on a synced drive.
