@@ -1,17 +1,18 @@
 """Command line.
 
-    python -m tres_poderes load-cota     load every downloaded yearly quota file of the Camara
-    python -m tres_poderes verify-cota   check that the database says what the files say
-
-The files come from tools/download_camara_cota.py. A file that cannot be read exactly is
+    python -m tres_poderes download-cota   download the Camara's yearly quota files
+    python -m tres_poderes load-cota       load every downloaded file into the database
+    python -m tres_poderes verify-cota     check that the database says what the files say
+A file that cannot be read exactly is
 refused and the command ends with a non-zero code, so a nightly job stops there instead of
 publishing from a partial load.
 """
 import argparse
+import datetime
 import pathlib
 import sys
 
-from tres_poderes import cota
+from tres_poderes import cota, download
 from tres_poderes.money import format_brl
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -118,20 +119,37 @@ def verify_cota(raw, database, out):
     return 1 if problems else 0
 
 
+def download_cota(raw, years, keep, pause, fetch, out):
+    years = years or range(download.FIRST_YEAR, datetime.date.today().year + 1)
+    failed = 0
+    for outcome in download.download_cota(raw, years, fetch=fetch, keep=keep, pause=pause):
+        failed += not outcome.ok
+        print(f"{outcome.year}: {'' if outcome.ok else 'FAILED, '}{outcome.message}", file=out)
+    return 1 if failed else 0
+
+
 COMMANDS = {
     "load-cota": (load_cota, "load every downloaded yearly quota file of the Camara"),
     "verify-cota": (verify_cota, "check that the database says what the files say, to the centavo"),
 }
 
 
-def main(argv=None, out=sys.stdout):
+def main(argv=None, out=sys.stdout, fetch=download.fetch):
+    raw = ROOT / "data" / "raw" / "camara" / "cota"
     parser = argparse.ArgumentParser(prog="python -m tres_poderes")
     commands = parser.add_subparsers(dest="command", required=True)
+    get = commands.add_parser("download-cota", help="download the Camara's yearly quota files, keeping the versions replaced")
+    get.add_argument("years", nargs="*", type=int, help="only these years (default: every year from 2008)")
+    get.add_argument("--raw", type=pathlib.Path, default=raw)
+    get.add_argument("--keep", type=int, default=download.KEEP, help="versions kept per year")
+    get.add_argument("--pause", type=float, default=1.0, help="seconds between requests")
     for name, (_, text) in COMMANDS.items():
         command = commands.add_parser(name, help=text)
-        command.add_argument("--raw", type=pathlib.Path, default=ROOT / "data" / "raw" / "camara" / "cota")
+        command.add_argument("--raw", type=pathlib.Path, default=raw)
         command.add_argument("--db", type=pathlib.Path, default=ROOT / "data" / "tres_poderes.db")
     args = parser.parse_args(argv)
+    if args.command == "download-cota":
+        return download_cota(args.raw, args.years, args.keep, args.pause, fetch, out)
     return COMMANDS[args.command][0](args.raw, args.db, out)
 
 

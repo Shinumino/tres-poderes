@@ -7,7 +7,8 @@ parlamentar da Câmara dos Deputados.
 
 ## O que já funciona
 
-- Baixa os arquivos anuais da cota parlamentar publicados pela Câmara (2008 a 2026).
+- Baixa os arquivos anuais da cota parlamentar publicados pela Câmara (2008 a 2026) e guarda as
+  10 versões mais recentes de cada ano, para mostrar o que mudou.
 - Carrega cada recibo em um banco SQLite, com os valores em centavos inteiros.
 - Guarda, para cada recibo, de qual arquivo e de qual linha ele veio.
 - Confere o banco contra os arquivos: total do ano, total de cada deputado e conteúdo.
@@ -23,7 +24,7 @@ continuam na API da Câmara. Enquanto as duas fontes não forem cruzadas aqui, *
 Testado com Python 3.14. Não há nada para instalar.
 
 ```
-python tools/download_camara_cota.py     baixa os arquivos (cerca de 140 MB)
+python -m tres_poderes download-cota     baixa os arquivos (cerca de 140 MB)
 python -m tres_poderes load-cota         carrega no banco (cerca de 1 minuto)
 python -m tres_poderes verify-cota       confere o banco contra os arquivos
 check.cmd                                roda os testes

@@ -7,7 +7,7 @@ ordinary Brazilian can read it. Site language: pt-BR. Built one power at a time,
 
 | | |
 |---|---|
-| Run | `python tools/download_camara_cota.py`, then `python -m tres_poderes load-cota` |
+| Run | `python -m tres_poderes download-cota`, then `python -m tres_poderes load-cota` |
 | Test (narrow) | `python -m unittest tests.test_cota`, or `check.cmd -k <part of a test name>` |
 | Check (what CI will run) | `check.cmd` |
 | Prove the data | `python -m tres_poderes verify-cota` (database against the files, to the centavo) |
@@ -68,6 +68,13 @@ ordinary Brazilian can read it. Site language: pt-BR. Built one power at a time,
 
 ## Not built yet (so nobody assumes it is)
 
-Kept copies of each day's raw files (the downloader still overwrites, and is untested), the API
-cross-check, a continuity alarm, the deputies table, backups and a restore drill, the security pass,
-a changelog, any web page. CI runs `check.cmd` on every push (`.github/workflows/check.yml`).
+The API cross-check, a continuity alarm, the deputies table, backups and a restore drill, the
+security pass, a changelog, any web page. CI runs `check.cmd` on every push
+(`.github/workflows/check.yml`).
+
+## Downloads
+
+`download-cota` keeps the 10 most recent distinct versions of each year (the owner's limit,
+2026-10-12; `--keep`) under `data/raw/camara/cota/versions/`, with a manifest of hashes and dates.
+A download becomes the file in use only after the real loader has accepted it into a throwaway
+database. Tests reach it through a fake `fetch`; nothing in the suite touches the network.
