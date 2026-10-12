@@ -35,16 +35,37 @@ def receipt(deputy, liquido, **columns):
     return row
 
 
-def year_file(folder, year, receipts, name=None, header=HEADER):
-    """Write Ano-<year>.csv.zip into folder and return its path."""
+def year_file(folder, year, receipts, header=HEADER, zip_year=None, member_year=None):
+    """Write Ano-<year>.csv.zip into folder (created if missing) and return its path.
+
+    Two versions of the same year go in two folders, as two days' downloads would. zip_year and
+    member_year exist only to build files whose names lie about what is inside.
+    """
     text = io.StringIO(newline="")
-    writer = csv.writer(text, delimiter=";", quoting=csv.QUOTE_ALL, lineterminator="\r\n")
+    # The real files: every field quoted, LF line ends, a final newline (measured 2026-10-12).
+    writer = csv.writer(text, delimiter=";", quoting=csv.QUOTE_ALL, lineterminator="\n")
     writer.writerow(header)
     for row in receipts:
         row = {"numAno": str(year), **row}
         writer.writerow([row.get(name, "") for name in HEADER])
-    path = folder / (name or f"Ano-{year}.csv.zip")
+    return raw_year_file(folder, year, text.getvalue(), zip_year=zip_year, member_year=member_year)
+
+
+def raw_year_file(folder, year, text, zip_year=None, member_year=None):
+    """The same, from the CSV text itself, for files no writer would produce."""
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"Ano-{zip_year or year}.csv.zip"
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as archive:
         # The real files start with a UTF-8 byte order mark.
-        archive.writestr(f"Ano-{year}.csv", "﻿" + text.getvalue())
+        archive.writestr(f"Ano-{member_year or year}.csv", ("﻿" + text).encode("utf-8") if isinstance(text, str) else text)
     return path
+
+
+def header_line():
+    return ";".join(f'"{name}"' for name in HEADER) + "\n"
+
+
+def row_line(year, row):
+    """One receipt as the Camara writes it: every field quoted, a quote inside a value doubled."""
+    row = {"numAno": str(year), **row}
+    return ";".join('"' + row.get(name, "").replace('"', '""') + '"' for name in HEADER) + "\n"

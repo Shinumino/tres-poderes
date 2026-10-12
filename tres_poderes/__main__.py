@@ -9,16 +9,12 @@ publishing from a partial load.
 """
 import argparse
 import pathlib
-import re
 import sys
 
 from tres_poderes import cota
 from tres_poderes.money import format_brl
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-
-
-_YEAR_ZIP = re.compile(r"Ano-(\d{4})\.csv\.zip")
 
 
 def _year_files(raw, out):
@@ -61,9 +57,10 @@ def load_cota(raw, database, out):
 def _difference(db, said):
     """Why the database does not say what the file says, or None when it does.
 
-    Three checks, each catching what the one before cannot: the count and total of the year, then
-    the total of every deputy (a receipt credited to the wrong person changes neither of the
-    first two), then the content hash (a month or a supplier changing moves no total at all).
+    Each check catches what the one before cannot: the count and total of the year; the total of
+    every deputy (a receipt credited to the wrong person changes neither of the first two); the
+    typed columns against the receipt's own text; and last the year rebuilt from the database,
+    which must hash to the official file (a month or a supplier changing moves no total at all).
     """
     held = cota.receipt_count(db, said.ano), cota.total_liquido(db, said.ano)
     if held != (said.receipts, said.centavos):
@@ -82,8 +79,12 @@ def _difference(db, said):
             for d in moved[:5]
         )
         return f"same count and total, but {len(moved)} differ by deputy ({shown})"
-    if cota.loaded_sha256(db, said.ano) != said.sha256:
-        return "every total matches, but the content of the file is not what was loaded"
+    stored_sha256, disagree = cota.stored_content(db, said.ano)
+    if disagree:
+        shown = ", ".join(f"line {line}" for line in disagree[:5])
+        return f"{len(disagree)} stored receipts disagree with their own text ({shown})"
+    if stored_sha256 != said.sha256 or cota.loaded_sha256(db, said.ano) != said.sha256:
+        return "every total matches, but the receipts stored are not exactly the receipts in the file"
     return None
 
 
@@ -107,7 +108,7 @@ def verify_cota(raw, database, out):
                 print(f"{said.ano}: DIFFERENT, {difference}", file=out)
             else:
                 print(f"{said.ano}: {said.receipts} receipts, {format_brl(said.centavos)}", file=out)
-        named = {int(match[1]) for match in map(_YEAR_ZIP.fullmatch, (path.name for path in paths)) if match}
+        named = {cota.year_of(path) for path in paths}
         for year in cota.years(db):
             if year not in named:
                 problems += 1

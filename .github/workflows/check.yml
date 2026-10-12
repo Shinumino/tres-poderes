@@ -1,0 +1,23 @@
+name: check
+
+# The same check.cmd a developer runs, on a machine that cannot be talked out of it.
+# Windows on purpose: it is the file CI runs, not a second script that could drift from it.
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: windows-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: check.cmd
+        shell: cmd
+        run: check.cmd

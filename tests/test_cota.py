@@ -4,7 +4,7 @@ import tempfile
 import unittest
 import zipfile
 
-from tests.samples import HEADER, receipt, year_file
+from tests.samples import HEADER, header_line, raw_year_file, receipt, row_line, year_file
 from tres_poderes import cota
 
 
@@ -58,6 +58,20 @@ class LoadingAYear(CotaTestCase):
         self.assertEqual(leadership.campos["txNomeParlamentar"], "LID.GOV-CD")
         self.assertIsNone(leadership.deputado)
 
+    def test_values_the_real_files_contain_come_back_exactly(self):
+        # Both occur in the real files: a quote inside a supplier's name, a line break inside a field.
+        path = year_file(self.folder, 2099, [
+            receipt(1001, "10", txtFornecedor='POSTO "ESTRELA" LTDA'),
+            receipt(1001, "20", txtTrecho="BSB/GRU\nGRU/BSB"),
+        ])
+
+        cota.load_cota(self.db, path)
+
+        first, second = cota.receipts(self.db, 2099, deputy=1001)
+        self.assertEqual(first.campos["txtFornecedor"], 'POSTO "ESTRELA" LTDA')
+        self.assertEqual(second.campos["txtTrecho"], "BSB/GRU\nGRU/BSB")
+        self.assertEqual(cota.total_liquido(self.db, 2099), 3000)
+
 
 class LoadingAgain(CotaTestCase):
     def test_the_same_file_twice_changes_nothing(self):
@@ -67,25 +81,25 @@ class LoadingAgain(CotaTestCase):
         cota.load_cota(self.db, path)
         cota.load_cota(self.db, path)
         # The Camara rebuilds every zip each night: the same receipts arrive in a file whose bytes differ.
-        cota.load_cota(self.db, year_file(self.folder, 2099, rows, name="tomorrow.zip"))
+        cota.load_cota(self.db, year_file(self.folder / "tomorrow", 2099, rows))
 
         self.assertEqual(cota.total_liquido(self.db, 2099), 15000)
         self.assertEqual(len(cota.receipts(self.db, 2099, deputy=1001)), 2)
 
     def test_a_newer_file_replaces_its_year_and_only_its_year(self):
         cota.load_cota(self.db, year_file(self.folder, 2098, [receipt(1001, "999")]))
-        cota.load_cota(self.db, year_file(self.folder, 2099, [
+        cota.load_cota(self.db, year_file(self.folder / "monday", 2099, [
             receipt(1001, "100", ideDocumento="1"),
             receipt(1001, "50", ideDocumento="2"),
             receipt(2002, "70", ideDocumento="3"),
-        ], name="monday.zip"))
+        ]))
 
         # Tuesday: receipt 1 was corrected down, receipt 2 was withdrawn, receipt 4 is new.
-        cota.load_cota(self.db, year_file(self.folder, 2099, [
+        cota.load_cota(self.db, year_file(self.folder / "tuesday", 2099, [
             receipt(1001, "80", ideDocumento="1"),
             receipt(2002, "70", ideDocumento="3"),
             receipt(2002, "5.25", ideDocumento="4"),
-        ], name="tuesday.zip"))
+        ]))
 
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=1001), 8000)
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=2002), 7525)
@@ -93,19 +107,48 @@ class LoadingAgain(CotaTestCase):
         self.assertEqual(cota.total_liquido(self.db, 2098), 99900)
 
 
+def unclosed_quote(folder):
+    """A receipt whose last field never closes its quote, followed by an unquoted receipt.
+
+    A forgiving CSV reader takes the second receipt for the tail of the first one's last field:
+    one receipt of R$ 100,00 where the file holds R$ 150,00.
+    """
+    first = row_line(2099, receipt(1001, "100"))[:-2] + "\n"
+    second = row_line(2099, receipt(1001, "50")).replace('"', "")
+    return raw_year_file(folder, 2099, header_line() + first + second)
+
+
+def not_utf8(folder):
+    text = header_line() + row_line(2099, receipt(1001, "100", txtFornecedor="POSTO"))
+    return raw_year_file(folder, 2099, b"\xef\xbb\xbf" + text.encode("utf-8").replace(b"POSTO", b"POST\xff"))
+
+
+def damaged_inside(folder):
+    """A zip whose list of contents is intact and whose compressed data is not."""
+    path = year_file(folder, 2099, [receipt(1001, "1", ideDocumento=str(n)) for n in range(200)])
+    data = bytearray(path.read_bytes())
+    data[80:120] = bytes(40)
+    path.write_bytes(data)
+    return path
+
+
 class RefusingABadFile(CotaTestCase):
     """A file we cannot read exactly is refused whole: the year keeps what it had."""
 
     def setUp(self):
         super().setUp()
-        cota.load_cota(self.db, year_file(self.folder, 2099, [receipt(1001, "100")], name="good.zip"))
+        cota.load_cota(self.db, year_file(self.folder / "good", 2099, [receipt(1001, "100")]))
+        self.bad = self.folder / "bad"
 
-    def refused(self, rows, **file_options):
+    def refused_file(self, path):
         with self.assertRaises(cota.BadFile) as caught:
-            cota.load_cota(self.db, year_file(self.folder, 2099, rows, name="bad.zip", **file_options))
+            cota.load_cota(self.db, path)
         self.assertEqual(cota.total_liquido(self.db, 2099), 10000)
         self.assertEqual(len(cota.receipts(self.db, 2099, deputy=1001)), 1)
         return str(caught.exception)
+
+    def refused(self, rows, **file_options):
+        return self.refused_file(year_file(self.bad, 2099, rows, **file_options))
 
     def test_an_amount_paid_that_is_not_exact_centavos(self):
         message = self.refused([receipt(1001, "50"), receipt(1001, "18.235")])
@@ -137,35 +180,59 @@ class RefusingABadFile(CotaTestCase):
         self.assertIn("line 4", message)
         self.assertIn("line 2", message)
 
-    def test_a_file_named_for_one_year_that_holds_another(self):
-        cota.load_cota(self.db, year_file(self.folder, 2098, [receipt(1001, "7")], name="older.zip"))
+    def test_a_line_with_an_unclosed_quote_that_would_swallow_the_next_receipt(self):
+        self.refused_file(unclosed_quote(self.bad))
 
-        # Ano-2099.csv inside, every row saying 2098: it must not replace 2098.
-        self.refused([receipt(1001, "1", numAno="2098")])
+    def test_text_that_is_not_utf8(self):
+        self.refused_file(not_utf8(self.bad))
 
-        self.assertEqual(cota.total_liquido(self.db, 2098), 700)
+    def test_a_zip_damaged_inside(self):
+        self.refused_file(damaged_inside(self.bad))
 
     def test_a_download_that_is_not_a_zip(self):
-        path = self.folder / "Ano-2099.csv.zip"
+        self.bad.mkdir()
+        path = self.bad / "Ano-2099.csv.zip"
         path.write_bytes(b"<html><body>503 Service Unavailable</body></html>")
 
-        with self.assertRaises(cota.BadFile):
-            cota.load_cota(self.db, path)
-
-        self.assertEqual(cota.total_liquido(self.db, 2099), 10000)
+        self.refused_file(path)
 
     def test_a_zip_that_is_not_one_yearly_file(self):
+        self.bad.mkdir()
         for members in (["Ano-2099.csv", "extra.txt"], ["despesas.csv"], []):
             with self.subTest(members=members):
-                path = self.folder / "odd.zip"
+                path = self.bad / "Ano-2099.csv.zip"
                 with zipfile.ZipFile(path, "w") as archive:
                     for member in members:
                         archive.writestr(member, "x")
 
-                with self.assertRaises(cota.BadFile):
-                    cota.load_cota(self.db, path)
+                self.refused_file(path)
 
-                self.assertEqual(cota.total_liquido(self.db, 2099), 10000)
+
+class RefusingAFileWhoseNamesLie(CotaTestCase):
+    """The year is said three times: by the zip's name, by the CSV's name, by every row. All must agree."""
+
+    def setUp(self):
+        super().setUp()
+        self.rows_of_2098 = [receipt(1001, "7")]
+        cota.load_cota(self.db, year_file(self.folder / "older", 2098, self.rows_of_2098))
+
+    def refused(self, path):
+        with self.assertRaises(cota.BadFile):
+            cota.load_cota(self.db, path)
+        self.assertEqual(cota.total_liquido(self.db, 2098), 700)
+        self.assertEqual(cota.total_liquido(self.db, 2099), 0)
+
+    def test_the_csv_is_named_for_one_year_and_its_rows_say_another(self):
+        # Ano-2099.csv inside, every row saying 2098: it must not replace 2098.
+        self.refused(year_file(self.folder / "bad", 2099, [receipt(1001, "1", numAno="2098")]))
+
+    def test_the_zip_is_named_for_one_year_and_holds_another(self):
+        # Ano-2099.csv.zip holding a perfectly good Ano-2098.csv: it must not replace 2098 either.
+        self.refused(year_file(self.folder / "bad", 2098, [receipt(1001, "1")], zip_year=2099))
+
+    def test_content_already_loaded_as_one_year_arrives_named_as_another(self):
+        # The very bytes loaded as 2098, repackaged as Ano-2099.csv: "already loaded" must not wave it through.
+        self.refused(year_file(self.folder / "bad", 2098, self.rows_of_2098, zip_year=2099, member_year=2099))
 
 
 class WhereAReceiptCameFrom(CotaTestCase):
@@ -196,12 +263,35 @@ class WhereAReceiptCameFrom(CotaTestCase):
 
 
 class ReadingWhileALoadIsWriting(CotaTestCase):
-    def test_a_reader_is_not_locked_out_and_sees_the_year_as_it_was(self):
+    def test_a_reader_sees_the_whole_old_year_until_the_new_one_is_complete(self):
+        path = self.folder / "site.db"
+        writer, reader = cota.connect(path), cota.connect(path)
+        self.addCleanup(writer.close)
+        self.addCleanup(reader.close)
+        cota.load_cota(writer, year_file(self.folder / "monday", 2099, [receipt(1001, "100"), receipt(1001, "50")]))
+
+        # SQLite calls this again and again while the writer works, so the reader looks in at
+        # every stage of the replacement: after the old year is deleted, between the inserts.
+        seen = set()
+        writer.set_progress_handler(lambda: seen.add((cota.receipt_count(reader, 2099), cota.total_liquido(reader, 2099))), 1)
+        cota.load_cota(writer, year_file(self.folder / "tuesday", 2099, [
+            receipt(1001, "80"), receipt(2002, "5.25"), receipt(2002, "1"),
+        ]))
+        writer.set_progress_handler(None, 1)
+
+        # It looked in during the old year, and never saw anything but a whole year: no empty
+        # year after the delete, no year with one or two of the three new receipts.
+        whole_old, whole_new = (2, 15000), (3, 8625)
+        self.assertIn(whole_old, seen)
+        self.assertLessEqual(seen, {whole_old, whole_new})
+        self.assertEqual((cota.receipt_count(reader, 2099), cota.total_liquido(reader, 2099)), whole_new)
+
+    def test_a_reader_is_not_locked_out_while_a_writer_holds_the_database(self):
         path = self.folder / "site.db"
         writer = cota.connect(path)
         self.addCleanup(writer.close)
         cota.load_cota(writer, year_file(self.folder, 2099, [receipt(1001, "100")]))
-        # What a load holds while it is replacing a year, frozen so the test can look.
+        # Without the write-ahead log this lock makes the reader fail with "database is locked".
         writer.execute("BEGIN EXCLUSIVE")
         self.addCleanup(writer.rollback)
 
@@ -209,6 +299,22 @@ class ReadingWhileALoadIsWriting(CotaTestCase):
         self.addCleanup(reader.close)
 
         self.assertEqual(cota.total_liquido(reader, 2099), 10000)
+
+
+class WhatAFileSays(CotaTestCase):
+    """file_totals is the second opinion on a file, so it must be as hard to fool as the loader."""
+
+    def test_it_refuses_what_the_loader_refuses(self):
+        builders = {
+            "unclosed quote": unclosed_quote,
+            "not utf-8": not_utf8,
+            "damaged inside": damaged_inside,
+            "zip named for another year": lambda folder: year_file(folder, 2098, [receipt(1001, "1")], zip_year=2099),
+            "rows of another year": lambda folder: year_file(folder, 2099, [receipt(1001, "1", numAno="2098")]),
+        }
+        for name, build in builders.items():
+            with self.subTest(name), self.assertRaises(cota.BadFile):
+                cota.file_totals(build(self.folder / name))
 
 
 if __name__ == "__main__":

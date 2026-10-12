@@ -1,9 +1,10 @@
 import io
 import pathlib
+import sqlite3
 import tempfile
 import unittest
 
-from tests.samples import receipt, year_file
+from tests.samples import header_line, raw_year_file, receipt, year_file
 from tres_poderes import cota
 from tres_poderes.__main__ import main
 
@@ -156,13 +157,46 @@ class VerifyCotaCommand(unittest.TestCase):
         self.assertIn("no file", line)
 
     def test_a_file_that_cannot_be_read_is_reported_and_the_rest_still_checked(self):
-        (self.raw / "Ano-2098.csv.zip").write_bytes(b"not a zip at all")
+        unreadable = {
+            "not a zip": lambda: (self.raw / "Ano-2098.csv.zip").write_bytes(b"not a zip at all"),
+            "not utf-8": lambda: raw_year_file(self.raw, 2098, b"\xef\xbb\xbf" + header_line().encode() + b'"\xff"\n'),
+        }
+        for name, spoil in unreadable.items():
+            with self.subTest(name):
+                self.out = io.StringIO()
+                spoil()
+
+                code = main(["verify-cota", *self.arguments], out=self.out)
+
+                self.assertEqual(code, 1)
+                [line] = [line for line in self.out.getvalue().splitlines() if "UNREADABLE" in line]
+                self.assertIn("Ano-2098.csv.zip", line)
+                self.assertIn("2099: 3 receipts, R$ 1.174,43", self.out.getvalue())
+
+    def tamper(self, sql):
+        db = sqlite3.connect(self.raw / "out.db")
+        with db:
+            db.execute(sql)
+        db.close()
+
+    def test_stored_receipts_changed_behind_the_loaders_back_fail(self):
+        # No total moves and the file is untouched: only the stored receipts are not the file's any more.
+        self.tamper("UPDATE camara_cota SET mes = 12, numMes = '12' WHERE ano = 2099")
 
         code = main(["verify-cota", *self.arguments], out=self.out)
 
         self.assertEqual(code, 1)
-        self.assertIn("Ano-2098.csv.zip", self.out.getvalue())
-        self.assertIn("2099: 3 receipts, R$ 1.174,43", self.out.getvalue())
+        [line] = self.different_lines()
+        self.assertIn("2099", line)
+
+    def test_a_stored_month_that_disagrees_with_the_receipts_own_text_fails(self):
+        self.tamper("UPDATE camara_cota SET mes = 12 WHERE ano = 2099 AND liquido_centavos = 146700")
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        [line] = self.different_lines()
+        self.assertIn("line 2", line)
 
 
 if __name__ == "__main__":

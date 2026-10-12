@@ -15,6 +15,7 @@ import pathlib
 import re
 import sqlite3
 import zipfile
+import zlib
 
 from tres_poderes.money import parse_centavos
 
@@ -51,6 +52,7 @@ CREATE TABLE IF NOT EXISTS camara_cota_arquivo (
 ) STRICT;
 """
 
+_YEAR_ZIP = re.compile(r"Ano-(\d{4})\.csv\.zip")  # a yearly download, as the Camara names it
 _YEAR_FILE = re.compile(r"Ano-(\d{4})\.csv")  # the one file inside every yearly zip, 2008 to 2026
 _TYPED = 5  # ano, mes, deputado, liquido_centavos, linha: the columns before the Camara's own
 _INSERT = f"INSERT INTO camara_cota VALUES ({', '.join('?' * (_TYPED + len(COLUMNS)))})"
@@ -100,6 +102,13 @@ def _typed(line, row, year):
         raise BadFile(f"line {line}: {error}") from error
 
 
+def _reader(raw):
+    # strict: quoting that does not close is an error. The forgiving default reads on to the end
+    # of the file and hands back every following receipt as the tail of one field, so a year
+    # loads short and still looks whole. The 19 real files all parse strictly.
+    return csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""), delimiter=";", strict=True)
+
+
 def _sha256(stream):
     digest = hashlib.sha256()
     for chunk in iter(lambda: stream.read(1 << 20), b""):
@@ -117,11 +126,12 @@ def load_cota(db, zip_path):
     with _year_archive(zip_path) as (archive, member, year):
         with archive.open(member) as raw:
             content = _sha256(raw)
-        already = db.execute("SELECT ano FROM camara_cota_arquivo WHERE sha256 = ?", (content,)).fetchone()
-        if already:
-            return already[0]
+        # "Already loaded" means this content AS THIS YEAR. The same bytes arriving under another
+        # year's name are not skipped: they go on to be checked row by row, and refused.
+        if db.execute("SELECT 1 FROM camara_cota_arquivo WHERE sha256 = ? AND ano = ?", (content, year)).fetchone():
+            return year
         with archive.open(member) as raw:
-            reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""), delimiter=";")
+            reader = _reader(raw)
             found = tuple(reader.fieldnames or ())
             if found != COLUMNS:
                 # The Camara renaming or adding a column is exactly when a loader goes quietly wrong.
@@ -151,9 +161,24 @@ def _year_archive(zip_path):
     with archive:
         members = archive.namelist()
         named = _YEAR_FILE.fullmatch(members[0]) if len(members) == 1 else None
-        if not named:
-            raise BadFile(f"{name}: expected exactly one file inside, named Ano-<year>.csv, found {members}")
-        yield archive, members[0], int(named[1])
+        # The zip's own name counts too: Ano-2099.csv.zip holding a sound Ano-2098.csv would
+        # replace 2098 and leave 2099 as it was, with nothing to say so.
+        if not named or year_of(zip_path) != int(named[1]):
+            raise BadFile(f"{name}: expected Ano-<year>.csv.zip holding exactly Ano-<year>.csv of the same year, found {members}")
+        try:
+            yield archive, members[0], int(named[1])
+        except BadFile:
+            raise
+        except (UnicodeDecodeError, csv.Error, zlib.error, EOFError, zipfile.BadZipFile) as error:
+            # Damage that only shows while reading: bytes that are not UTF-8, quoting that does not
+            # close, compressed data cut short. Each has its own exception; all mean "refuse".
+            raise BadFile(f"{name}: cannot be read ({error})") from error
+
+
+def year_of(zip_path):
+    """The year a yearly zip is named for, or None when it is not named Ano-<year>.csv.zip."""
+    named = _YEAR_ZIP.fullmatch(pathlib.Path(zip_path).name)
+    return int(named[1]) if named else None
 
 
 def _rows(reader, year):
@@ -223,7 +248,7 @@ def file_totals(zip_path):
         with archive.open(member) as raw:
             content = _sha256(raw)
         with archive.open(member) as raw:
-            reader = csv.DictReader(io.TextIOWrapper(raw, encoding="utf-8-sig", newline=""), delimiter=";")
+            reader = _reader(raw)
             for row in reader:
                 try:
                     amount = decimal.Decimal(row["vlrLiquido"])
@@ -256,6 +281,42 @@ def loaded_sha256(db, year):
     """Hash of the file content the year was loaded from, or None when the year was never loaded."""
     row = db.execute("SELECT sha256 FROM camara_cota_arquivo WHERE ano = ?", (year,)).fetchone()
     return row[0] if row else None
+
+
+_AS_WRITTEN = {name: COLUMNS.index(name) for name in ("numAno", "numMes", "ideCadastro", "vlrLiquido")}
+
+
+def _csv_line(values):
+    # The Camara's format: every field quoted, a quote inside a value doubled, LF at the end.
+    return ('"' + '";"'.join(value.replace('"', '""') for value in values) + '"\n').encode("utf-8")
+
+
+def stored_content(db, year):
+    """(sha256, lines) of what the database holds for a year.
+
+    The hash is of the year's CSV rebuilt from the stored columns in the Camara's own format. It
+    equals the hash of the official file only if every receipt is there, in order and unchanged,
+    which also proves the reading lost nothing: all 19 real files rebuild byte for byte (checked
+    2026-10-12). The lines are receipts whose typed columns no longer agree with their own text.
+    """
+    digest = hashlib.sha256(b"\xef\xbb\xbf" + _csv_line(COLUMNS))
+    disagree = []
+    for row in db.execute("SELECT * FROM camara_cota WHERE ano = ? ORDER BY linha", (year,)):
+        (*typed, line), written = row[:_TYPED], row[_TYPED:]
+        digest.update(_csv_line(written))
+        try:
+            deputy = written[_AS_WRITTEN["ideCadastro"]]
+            said = [
+                int(written[_AS_WRITTEN["numAno"]]),
+                int(written[_AS_WRITTEN["numMes"]]),
+                int(deputy) if deputy else None,
+                parse_centavos(written[_AS_WRITTEN["vlrLiquido"]]),
+            ]
+        except ValueError:
+            said = None
+        if said != typed:
+            disagree.append(line)
+    return digest.hexdigest(), disagree
 
 
 def totals_by_deputy(db, year):
