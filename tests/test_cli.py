@@ -23,7 +23,7 @@ class LoadCotaCommand(unittest.TestCase):
     def total(self, year):
         db = cota.connect(self.database)
         self.addCleanup(db.close)
-        return cota.total_liquido(db, year)
+        return cota.total_camara(db, year)
 
     def test_it_loads_every_year_file_in_the_folder_and_says_what_each_year_cost(self):
         year_file(self.raw, 2098, [receipt(1001, "10")])
@@ -182,6 +182,15 @@ class VerifyCotaCommand(unittest.TestCase):
     def test_stored_receipts_changed_behind_the_loaders_back_fail(self):
         # No total moves and the file is untouched: only the stored receipts are not the file's any more.
         self.tamper("UPDATE camara_cota SET mes = 12, numMes = '12' WHERE ano = 2099")
+
+        code = main(["verify-cota", *self.arguments], out=self.out)
+
+        self.assertEqual(code, 1)
+        [line] = self.different_lines()
+        self.assertIn("2099", line)
+
+    def test_stored_line_numbers_that_no_longer_point_at_the_receipts_fail(self):
+        self.tamper("UPDATE camara_cota SET linha = linha + 100 WHERE ano = 2099")
 
         code = main(["verify-cota", *self.arguments], out=self.out)
 

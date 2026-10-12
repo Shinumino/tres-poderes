@@ -48,7 +48,7 @@ def load_cota(raw, database, out):
                 refused += 1
                 print(f"{path.name}: REFUSED, {error}", file=out)
             else:
-                print(f"{year}: {format_brl(cota.total_liquido(db, year))}", file=out)
+                print(f"{year}: {format_brl(cota.total_camara(db, year))}", file=out)
     finally:
         db.close()
     return 1 if refused else 0
@@ -62,7 +62,7 @@ def _difference(db, said):
     typed columns against the receipt's own text; and last the year rebuilt from the database,
     which must hash to the official file (a month or a supplier changing moves no total at all).
     """
-    held = cota.receipt_count(db, said.ano), cota.total_liquido(db, said.ano)
+    held = cota.receipt_count(db, said.ano), cota.total_camara(db, said.ano)
     if held != (said.receipts, said.centavos):
         return (
             f"the file has {said.receipts} receipts and {format_brl(said.centavos)}, "

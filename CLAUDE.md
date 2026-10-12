@@ -52,6 +52,20 @@ ordinary Brazilian can read it. Site language: pt-BR. Built one power at a time,
 - A yearly file says its year three times: the zip's name, the CSV's name, every row. The loader
   refuses a file where they disagree; each of those gaps was a way to replace the wrong year.
 
+- The database is derived data: nothing in it exists that the files do not hold. After changing how
+  the loader reads, delete `data/tres_poderes.db` and load again (about 80 s). `load-cota` alone
+  will not redo a year whose file content it has already loaded. `verify-cota` does notice: it
+  flagged the 27 multi-line receipts the day `linha` changed from "where it ends" to "where it
+  starts".
+- `total_liquido` and `receipts` need a deputy; `total_camara` is the whole Camara and
+  `receipts_without_deputy` the leaderships. `None` used to mean "everyone" in one and "nobody" in
+  the other.
+
+## Known and not fixed
+
+- A load while another process holds the write lock ends in a traceback ("database is locked")
+  after 5 s instead of a plain message. The exit code is non-zero and nothing is half-written.
+
 ## Not built yet (so nobody assumes it is)
 
 Kept copies of each day's raw files (the downloader still overwrites, and is untested), the API

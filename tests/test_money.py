@@ -24,6 +24,17 @@ class WhatCannotBeExactIsRefused(unittest.TestCase):
             with self.subTest(text=text), self.assertRaises(ValueError):
                 parse_centavos(text)
 
+    def test_digits_other_than_the_plain_ten_are_refused(self):
+        for text in ("１２.３４", "١٢.٣٤"):
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                parse_centavos(text)
+
+    def test_an_amount_too_long_to_be_money_is_refused(self):
+        # Thirteen digits of reais is trillions, far beyond any receipt; twenty would not fit the database.
+        self.assertEqual(parse_centavos("9999999999999.99"), 999999999999999)
+        with self.assertRaises(ValueError):
+            parse_centavos("99999999999999999999")
+
     def test_anything_that_is_not_a_plain_amount_is_refused(self):
         for text in ("1,5", "R$ 10", "abc", "1e3", " 12", "12 ", "--5", "5.", ".5", "+5"):
             with self.subTest(text=text), self.assertRaises(ValueError):

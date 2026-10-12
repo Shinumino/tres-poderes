@@ -52,8 +52,10 @@ CREATE TABLE IF NOT EXISTS camara_cota_arquivo (
 ) STRICT;
 """
 
-_YEAR_ZIP = re.compile(r"Ano-(\d{4})\.csv\.zip")  # a yearly download, as the Camara names it
-_YEAR_FILE = re.compile(r"Ano-(\d{4})\.csv")  # the one file inside every yearly zip, 2008 to 2026
+# [0-9], not \d: in Python \d also matches the digits of every other script.
+_YEAR_ZIP = re.compile(r"Ano-([0-9]{4})\.csv\.zip")  # a yearly download, as the Camara names it
+_YEAR_FILE = re.compile(r"Ano-([0-9]{4})\.csv")  # the one file inside every yearly zip, 2008 to 2026
+_WHOLE = re.compile(r"[1-9][0-9]{0,8}")
 _TYPED = 5  # ano, mes, deputado, liquido_centavos, linha: the columns before the Camara's own
 _INSERT = f"INSERT INTO camara_cota VALUES ({', '.join('?' * (_TYPED + len(COLUMNS)))})"
 
@@ -78,22 +80,34 @@ class BadFile(ValueError):
     """
 
 
+def _whole(name, text):
+    """A year, month or deputy id: the plain ten digits, no sign, no space, no leading zero.
+
+    int() would also take " 12", "+12", "1_2", "007" and digits from other scripts. The real files
+    use none of those (checked 2026-10-12), so one of them is a file to refuse, not to tidy up:
+    "007" is not quietly deputy 7.
+    """
+    if not _WHOLE.fullmatch(text):
+        raise ValueError(f"{name} is {text!r}")
+    return int(text)
+
+
 def _typed(line, row, year):
     try:
         if None in row or None in row.values():
             raise ValueError("wrong number of fields")
-        if int(row["numAno"]) != year:
+        if _whole("numAno", row["numAno"]) != year:
             raise ValueError(f"numAno is {row['numAno']} in the file of {year}")
         liquido = parse_centavos(row["vlrLiquido"])
         if liquido is None:
             raise ValueError("vlrLiquido is empty")
-        month = int(row["numMes"])
+        month = _whole("numMes", row["numMes"])
         if not 1 <= month <= 12:
             raise ValueError(f"numMes is {month}")
         return (
             year,
             month,
-            int(row["ideCadastro"]) if row["ideCadastro"] else None,
+            _whole("ideCadastro", row["ideCadastro"]) if row["ideCadastro"] else None,
             liquido,
             line,
             *(row[name] for name in COLUMNS),
@@ -169,9 +183,10 @@ def _year_archive(zip_path):
             yield archive, members[0], int(named[1])
         except BadFile:
             raise
-        except (UnicodeDecodeError, csv.Error, zlib.error, EOFError, zipfile.BadZipFile) as error:
+        except (UnicodeDecodeError, csv.Error, zlib.error, EOFError, zipfile.BadZipFile, RuntimeError, NotImplementedError) as error:
             # Damage that only shows while reading: bytes that are not UTF-8, quoting that does not
-            # close, compressed data cut short. Each has its own exception; all mean "refuse".
+            # close, compressed data cut short, a member that is encrypted or packed in a way this
+            # Python cannot unpack. Each has its own exception; all mean "refuse".
             raise BadFile(f"{name}: cannot be read ({error})") from error
 
 
@@ -183,13 +198,18 @@ def year_of(zip_path):
 
 def _rows(reader, year):
     lines = {}  # digest of a row -> the line it was first seen on
+    end = reader.line_num  # the header
     for row in reader:
-        line = reader.line_num
+        # The line where the receipt STARTS. A few real receipts have a line break inside a field
+        # (27 of them, counted 2026-10-12); line_num alone would point at where they end.
+        line, end = end + 1, reader.line_num
         typed = _typed(line, row, year)
         # The 19 real files hold 5.2 million receipts and not one exact copy (counted 2026-10-12).
         # A copy therefore means the same reimbursement arrived twice, and adding it would pay it
-        # into somebody's total twice.
-        digest = hashlib.blake2b("\x1f".join(typed[_TYPED:]).encode(), digest_size=16).digest()
+        # into somebody's total twice. The lengths go in so that the same characters split
+        # differently between two fields are not taken for a copy.
+        written = typed[_TYPED:]
+        digest = hashlib.blake2b((",".join(str(len(value)) for value in written) + "\x1f" + "".join(written)).encode(), digest_size=16).digest()
         if digest in lines:
             raise BadFile(f"line {line}: an exact copy of line {lines[digest]}")
         lines[digest] = line
@@ -219,7 +239,7 @@ def _receipts(db, where, args):
 
 def receipts(db, year, deputy):
     """One deputy's receipts in a year, in month order."""
-    return _receipts(db, "c.ano = ? AND c.deputado = ?", (year, deputy))
+    return _receipts(db, "c.ano = ? AND c.deputado = ?", (year, _a_deputy(deputy)))
 
 
 def receipts_without_deputy(db, year):
@@ -301,21 +321,24 @@ def stored_content(db, year):
     """
     digest = hashlib.sha256(b"\xef\xbb\xbf" + _csv_line(COLUMNS))
     disagree = []
+    starts = 2  # the line the next receipt must start on; the header is line 1
     for row in db.execute("SELECT * FROM camara_cota WHERE ano = ? ORDER BY linha", (year,)):
         (*typed, line), written = row[:_TYPED], row[_TYPED:]
-        digest.update(_csv_line(written))
+        as_in_file = _csv_line(written)
+        digest.update(as_in_file)
         try:
             deputy = written[_AS_WRITTEN["ideCadastro"]]
             said = [
-                int(written[_AS_WRITTEN["numAno"]]),
-                int(written[_AS_WRITTEN["numMes"]]),
-                int(deputy) if deputy else None,
+                _whole("numAno", written[_AS_WRITTEN["numAno"]]),
+                _whole("numMes", written[_AS_WRITTEN["numMes"]]),
+                _whole("ideCadastro", deputy) if deputy else None,
                 parse_centavos(written[_AS_WRITTEN["vlrLiquido"]]),
             ]
         except ValueError:
             said = None
-        if said != typed:
+        if said != typed or line != starts:
             disagree.append(line)
+        starts += as_in_file.count(b"\n")
     return digest.hexdigest(), disagree
 
 
@@ -329,10 +352,21 @@ def receipt_count(db, year):
     return db.execute("SELECT COUNT(*) FROM camara_cota WHERE ano = ?", (year,)).fetchone()[0]
 
 
-def total_liquido(db, year, deputy=None):
-    """Centavos the quota paid in a year: for one deputy, or for the whole Camara when deputy is None."""
+def _a_deputy(deputy):
+    # None is what a leadership receipt has for a deputy. It used to mean "the whole Camara" in
+    # total_liquido and "nobody" in receipts, so a page asking for "this receipt's deputy's total"
+    # would have printed the Camara's quarter of a billion beside a leadership's name.
     if deputy is None:
-        query, args = "SELECT COALESCE(SUM(liquido_centavos), 0) FROM camara_cota WHERE ano = ?", (year,)
-    else:
-        query, args = "SELECT COALESCE(SUM(liquido_centavos), 0) FROM camara_cota WHERE ano = ? AND deputado = ?", (year, deputy)
-    return db.execute(query, args).fetchone()[0]
+        raise ValueError("no deputy given: use total_camara for the whole Camara, receipts_without_deputy for the leaderships")
+    return deputy
+
+
+def total_liquido(db, year, deputy):
+    """Centavos the quota paid for one deputy in a year."""
+    query = "SELECT COALESCE(SUM(liquido_centavos), 0) FROM camara_cota WHERE ano = ? AND deputado = ?"
+    return db.execute(query, (year, _a_deputy(deputy))).fetchone()[0]
+
+
+def total_camara(db, year):
+    """Centavos the quota paid in a year for the whole Camara: every deputy and the party leaderships."""
+    return db.execute("SELECT COALESCE(SUM(liquido_centavos), 0) FROM camara_cota WHERE ano = ?", (year,)).fetchone()[0]

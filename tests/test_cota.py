@@ -31,7 +31,7 @@ class LoadingAYear(CotaTestCase):
         # Worked by hand: 1467.00 + 3668.93 - 298.07 = 4837.86, and 0.10 more for the second deputy.
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=1001), 483786)
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=2002), 10)
-        self.assertEqual(cota.total_liquido(self.db, 2099), 483796)
+        self.assertEqual(cota.total_camara(self.db, 2099), 483796)
 
     def test_many_small_receipts_do_not_drift(self):
         # Ten times R$ 0,10 is R$ 1,00. In floating point it is 0.9999999999999999.
@@ -50,13 +50,36 @@ class LoadingAYear(CotaTestCase):
 
         cota.load_cota(self.db, path)
 
-        self.assertEqual(cota.total_liquido(self.db, 2099), 35050)
+        self.assertEqual(cota.total_camara(self.db, 2099), 35050)
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=1001), 10000)
         self.assertEqual([r.liquido_centavos for r in cota.receipts(self.db, 2099, deputy=1001)], [10000])
         [leadership] = cota.receipts_without_deputy(self.db, 2099)
         self.assertEqual(leadership.liquido_centavos, 25050)
         self.assertEqual(leadership.campos["txNomeParlamentar"], "LID.GOV-CD")
         self.assertIsNone(leadership.deputado)
+
+    def test_the_camaras_total_and_one_deputys_total_cannot_be_taken_for_each_other(self):
+        cota.load_cota(self.db, year_file(self.folder, 2099, [receipt(1001, "100"), receipt(None, "250.50")]))
+        [leadership] = cota.receipts_without_deputy(self.db, 2099)
+
+        # A leadership receipt has no deputy. Asking for "its deputy's total" used to answer with
+        # the whole Camara's, which a page would have printed beside the leadership's name.
+        with self.assertRaises(ValueError):
+            cota.total_liquido(self.db, 2099, leadership.deputado)
+        with self.assertRaises(ValueError):
+            cota.receipts(self.db, 2099, leadership.deputado)
+        self.assertEqual(cota.total_camara(self.db, 2099), 35050)
+
+    def test_receipts_that_are_alike_except_for_where_a_separator_falls_are_two_receipts(self):
+        # Not copies of each other: the same characters, split differently between two fields.
+        path = year_file(self.folder, 2099, [
+            receipt(1001, "10", txtFornecedor="A\x1fB", txtCNPJCPF="C"),
+            receipt(1001, "10", txtFornecedor="A", txtCNPJCPF="B\x1fC"),
+        ])
+
+        cota.load_cota(self.db, path)
+
+        self.assertEqual(cota.total_camara(self.db, 2099), 2000)
 
     def test_values_the_real_files_contain_come_back_exactly(self):
         # Both occur in the real files: a quote inside a supplier's name, a line break inside a field.
@@ -70,7 +93,7 @@ class LoadingAYear(CotaTestCase):
         first, second = cota.receipts(self.db, 2099, deputy=1001)
         self.assertEqual(first.campos["txtFornecedor"], 'POSTO "ESTRELA" LTDA')
         self.assertEqual(second.campos["txtTrecho"], "BSB/GRU\nGRU/BSB")
-        self.assertEqual(cota.total_liquido(self.db, 2099), 3000)
+        self.assertEqual(cota.total_camara(self.db, 2099), 3000)
 
 
 class LoadingAgain(CotaTestCase):
@@ -83,7 +106,7 @@ class LoadingAgain(CotaTestCase):
         # The Camara rebuilds every zip each night: the same receipts arrive in a file whose bytes differ.
         cota.load_cota(self.db, year_file(self.folder / "tomorrow", 2099, rows))
 
-        self.assertEqual(cota.total_liquido(self.db, 2099), 15000)
+        self.assertEqual(cota.total_camara(self.db, 2099), 15000)
         self.assertEqual(len(cota.receipts(self.db, 2099, deputy=1001)), 2)
 
     def test_a_newer_file_replaces_its_year_and_only_its_year(self):
@@ -103,8 +126,8 @@ class LoadingAgain(CotaTestCase):
 
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=1001), 8000)
         self.assertEqual(cota.total_liquido(self.db, 2099, deputy=2002), 7525)
-        self.assertEqual(cota.total_liquido(self.db, 2099), 15525)
-        self.assertEqual(cota.total_liquido(self.db, 2098), 99900)
+        self.assertEqual(cota.total_camara(self.db, 2099), 15525)
+        self.assertEqual(cota.total_camara(self.db, 2098), 99900)
 
 
 def unclosed_quote(folder):
@@ -143,7 +166,7 @@ class RefusingABadFile(CotaTestCase):
     def refused_file(self, path):
         with self.assertRaises(cota.BadFile) as caught:
             cota.load_cota(self.db, path)
-        self.assertEqual(cota.total_liquido(self.db, 2099), 10000)
+        self.assertEqual(cota.total_camara(self.db, 2099), 10000)
         self.assertEqual(len(cota.receipts(self.db, 2099, deputy=1001)), 1)
         return str(caught.exception)
 
@@ -179,6 +202,24 @@ class RefusingABadFile(CotaTestCase):
         message = self.refused([receipt(1001, "50"), receipt(1001, "60"), receipt(1001, "50")])
         self.assertIn("line 4", message)
         self.assertIn("line 2", message)
+
+    def test_a_bad_receipt_after_one_that_spans_lines_is_named_by_the_line_where_it_starts(self):
+        message = self.refused([receipt(1001, "20", txtTrecho="BSB/GRU\nGRU/BSB"), receipt(1001, "18.235")])
+        self.assertIn("line 4", message)
+
+    def test_numbers_written_any_way_but_plain_digits(self):
+        # The real files use plain digits with no sign, space or leading zero (checked 2026-10-12).
+        # Anything else is not cleaned up: "007" is not quietly deputy 7.
+        cases = {
+            "numMes": [" 1", "+1", "01", "1_0", "１"],
+            "ideCadastro": ["007", " 1001", "1_001", "0", "１００１", "99999999999999999999"],
+            "numAno": ["2099 ", "+2099", "２０９９"],
+            "vlrLiquido": ["１２.３４", "99999999999999999999", "+5"],
+        }
+        for column, values in cases.items():
+            for value in values:
+                with self.subTest(column=column, value=value):
+                    self.refused([receipt(1001, "50", **{column: value})])
 
     def test_a_line_with_an_unclosed_quote_that_would_swallow_the_next_receipt(self):
         self.refused_file(unclosed_quote(self.bad))
@@ -219,8 +260,8 @@ class RefusingAFileWhoseNamesLie(CotaTestCase):
     def refused(self, path):
         with self.assertRaises(cota.BadFile):
             cota.load_cota(self.db, path)
-        self.assertEqual(cota.total_liquido(self.db, 2098), 700)
-        self.assertEqual(cota.total_liquido(self.db, 2099), 0)
+        self.assertEqual(cota.total_camara(self.db, 2098), 700)
+        self.assertEqual(cota.total_camara(self.db, 2099), 0)
 
     def test_the_csv_is_named_for_one_year_and_its_rows_say_another(self):
         # Ano-2099.csv inside, every row saying 2098: it must not replace 2098.
@@ -229,6 +270,10 @@ class RefusingAFileWhoseNamesLie(CotaTestCase):
     def test_the_zip_is_named_for_one_year_and_holds_another(self):
         # Ano-2099.csv.zip holding a perfectly good Ano-2098.csv: it must not replace 2098 either.
         self.refused(year_file(self.folder / "bad", 2098, [receipt(1001, "1")], zip_year=2099))
+
+    def test_a_name_written_with_digits_other_than_the_plain_ten_is_no_yearly_file(self):
+        self.assertEqual(cota.year_of("Ano-2099.csv.zip"), 2099)
+        self.assertIsNone(cota.year_of("Ano-２０９９.csv.zip"))
 
     def test_content_already_loaded_as_one_year_arrives_named_as_another(self):
         # The very bytes loaded as 2098, repackaged as Ano-2099.csv: "already loaded" must not wave it through.
@@ -252,6 +297,18 @@ class WhereAReceiptCameFrom(CotaTestCase):
         self.assertEqual((first.linha, second.linha), (2, 4))
         self.assertEqual((first.arquivo, first.sha256), ("Ano-2099.csv", csv_sha256))
 
+    def test_a_receipt_that_spans_lines_is_found_on_the_line_where_it_starts(self):
+        # 27 real receipts have a line break inside a field (counted 2026-10-12).
+        path = year_file(self.folder, 2099, [
+            receipt(1001, "10"),
+            receipt(1001, "20", txtTrecho="BSB/GRU\nGRU/BSB"),
+            receipt(1001, "30"),
+        ])
+
+        cota.load_cota(self.db, path)
+
+        self.assertEqual([r.linha for r in cota.receipts(self.db, 2099, deputy=1001)], [2, 3, 5])
+
     def test_the_invoice_value_is_shown_as_written_even_when_it_is_not_exact_centavos(self):
         path = year_file(self.folder, 2099, [receipt(1001, "18.23", vlrDocumento="18.235")])
 
@@ -273,7 +330,7 @@ class ReadingWhileALoadIsWriting(CotaTestCase):
         # SQLite calls this again and again while the writer works, so the reader looks in at
         # every stage of the replacement: after the old year is deleted, between the inserts.
         seen = set()
-        writer.set_progress_handler(lambda: seen.add((cota.receipt_count(reader, 2099), cota.total_liquido(reader, 2099))), 1)
+        writer.set_progress_handler(lambda: seen.add((cota.receipt_count(reader, 2099), cota.total_camara(reader, 2099))), 1)
         cota.load_cota(writer, year_file(self.folder / "tuesday", 2099, [
             receipt(1001, "80"), receipt(2002, "5.25"), receipt(2002, "1"),
         ]))
@@ -284,7 +341,7 @@ class ReadingWhileALoadIsWriting(CotaTestCase):
         whole_old, whole_new = (2, 15000), (3, 8625)
         self.assertIn(whole_old, seen)
         self.assertLessEqual(seen, {whole_old, whole_new})
-        self.assertEqual((cota.receipt_count(reader, 2099), cota.total_liquido(reader, 2099)), whole_new)
+        self.assertEqual((cota.receipt_count(reader, 2099), cota.total_camara(reader, 2099)), whole_new)
 
     def test_a_reader_is_not_locked_out_while_a_writer_holds_the_database(self):
         path = self.folder / "site.db"
@@ -298,7 +355,7 @@ class ReadingWhileALoadIsWriting(CotaTestCase):
         reader = cota.connect(path)
         self.addCleanup(reader.close)
 
-        self.assertEqual(cota.total_liquido(reader, 2099), 10000)
+        self.assertEqual(cota.total_camara(reader, 2099), 10000)
 
 
 class WhatAFileSays(CotaTestCase):

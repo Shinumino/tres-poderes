@@ -10,7 +10,9 @@ import re
 # An allow-list, not a clean-up: digits, at most two decimals, optional minus. Whatever does not
 # fit is refused, never rounded, because "18.235" read loosely becomes R$ 20,35 without a word.
 # The Camara's vlrDocumento column has 5,487 such values (counted 2026-10-12); vlrLiquido has none.
-_PLAIN_AMOUNT = re.compile(r"-?\d+(\.\d{1,2})?")
+# [0-9], not \d: in Python \d also matches the digits of every other script. At most thirteen
+# digits of reais: trillions, far beyond any receipt, and a bound on what reaches the database.
+_PLAIN_AMOUNT = re.compile(r"-?[0-9]{1,13}(\.[0-9]{1,2})?")
 
 
 def parse_centavos(text):
