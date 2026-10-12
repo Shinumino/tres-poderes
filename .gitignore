@@ -1,0 +1,10 @@
+# Raw government downloads and the databases built from them are rebuilt by the tools,
+# never committed: they are hundreds of MB and the manifest records what was fetched.
+data/
+*.db
+*.db-wal
+*.db-shm
+
+__pycache__/
+.venv/
+.env
