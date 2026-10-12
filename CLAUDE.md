@@ -43,7 +43,17 @@ ordinary Brazilian can read it. Site language: pt-BR. Built one power at a time,
 - The owner's earlier project (Super-trunfo, kept outside this repository) is a read-only reference.
   Its database misses about half of 2023-2024 and is not a source of truth for totals.
 
+- The real files are less tidy than they look: values contain quote characters (doubled, as CSV
+  requires) and, from 2021 on, a few fields contain line breaks. So "one line is one receipt" is
+  false, and a gate against line breaks in fields would refuse real files.
+- Every one of the 19 real files can be rebuilt byte for byte from its parsed values. `verify-cota`
+  relies on this: the database must reproduce each official file exactly. If the Camara ever changes
+  how it writes the CSV (line ends, quoting, the byte order mark), that check goes red by design.
+- A yearly file says its year three times: the zip's name, the CSV's name, every row. The loader
+  refuses a file where they disagree; each of those gaps was a way to replace the wrong year.
+
 ## Not built yet (so nobody assumes it is)
 
-CI, kept copies of each day's raw files, the API cross-check, precomputed totals, backups and a
-restore drill, the security pass, a changelog, any web page.
+Kept copies of each day's raw files (the downloader still overwrites, and is untested), the API
+cross-check, a continuity alarm, the deputies table, backups and a restore drill, the security pass,
+a changelog, any web page. CI runs `check.cmd` on every push (`.github/workflows/check.yml`).
